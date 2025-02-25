@@ -1442,4 +1442,12 @@ else:
     - Matter profitability analysis
     - Practice area distribution
     - Billable vs. non-billable time tracking
-    - Custom visual
+    - Custom visualizations based on your needs
+    - And much more!
+    
+    Upload your Clio data export to get started.
+    """)
+
+# Footer
+st.markdown("---")
+st.markdown("© 2025 Law Firm Analytics Dashboard | Prototype Version")
