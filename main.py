@@ -53,6 +53,91 @@ def detect_column_types(df):
             
     return date_cols, numeric_cols, categorical_cols
 
+# Function to use Claude to analyze the CSV and identify relevant columns
+def analyze_csv_with_llm(df):
+    api_key = st.session_state.get('api_key')
+    
+    if not api_key or api_key == "your-default-api-key-here":
+        st.error("No valid API key configured. Please update the application with a valid Anthropic API key.")
+        return None
+    
+    client = anthropic.Anthropic(api_key=api_key)
+    
+    # Create a sample of the data for Claude to analyze
+    sample_rows = min(5, len(df))
+    data_sample = df.head(sample_rows).to_csv(index=False)
+    columns_info = "\n".join([f"- {col} (Type: {df[col].dtype}, Sample: {df[col].iloc[0] if not pd.isna(df[col].iloc[0]) else 'NA'})" for col in df.columns])
+    
+    # Create the prompt
+    prompt = f"""
+    I need you to analyze this CSV data from a law firm billing or practice management system.
+    
+    Here are the columns in the CSV:
+    {columns_info}
+    
+    Here's a sample of the data:
+    {data_sample}
+    
+    Please analyze this data and identify which columns correspond to the following important legal billing concepts:
+    
+    1. Client information (client name, client ID, etc.)
+    2. Matter information (matter description, matter ID, matter status)
+    3. Timekeeper information (attorney name, timekeeper ID)
+    4. Time entries (dates, hours worked, billable vs. non-billable)
+    5. Billing information (rates, amounts, values)
+    6. Categorization (practice area, case type, etc.)
+    
+    For each concept, tell me which column or columns in the CSV contain this information.
+    
+    Also, please suggest 3-5 interesting visualizations that would be valuable for law firm partners based on this specific data.
+    
+    Finally, identify what type of legal data this appears to be (e.g., time entries, matter summary, client profitability, etc.).
+    
+    Provide your response in JSON format like this:
+    {{
+        "data_type": "brief description of what this data represents",
+        "column_mapping": {{
+            "client": ["column name(s) for client info"],
+            "matter": ["column name(s) for matter info"],
+            "timekeeper": ["column name(s) for timekeeper info"],
+            "time_entries": ["column name(s) for time entries"],
+            "billing": ["column name(s) for billing info"],
+            "categorization": ["column name(s) for categorization"]
+        }},
+        "suggested_visualizations": [
+            {{
+                "title": "Visualization title",
+                "description": "Brief description of what this visualization would show"
+            }}
+        ]
+    }}
+    
+    Only return the JSON, nothing else.
+    """
+    
+    try:
+        message = client.messages.create(
+            model="claude-3-opus-20240229",
+            max_tokens=1024,
+            temperature=0,
+            system="You are an expert legal data analyst who specializes in analyzing law firm data. Provide responses in JSON format only.",
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        # Extract and parse the JSON response
+        try:
+            analysis = json.loads(message.content[0].text)
+            return analysis
+        except json.JSONDecodeError:
+            st.error("Failed to parse the analysis. Please try again or contact support.")
+            return None
+            
+    except Exception as e:
+        st.error(f"Error querying Claude API: {str(e)}")
+        return None
+
 # Function to generate LLM visualization recommendation
 def get_visualization_recommendation(df, question):
     # Use the API key that's already in session state
@@ -193,6 +278,10 @@ with st.sidebar:
             st.session_state.numeric_columns = numeric_cols
             st.session_state.categorical_columns = categorical_cols
             
+            # Reset analysis state
+            st.session_state.analyzed = False
+            st.session_state.llm_analysis_complete = False
+            
             st.success(f"File uploaded successfully with {len(data)} rows and {len(data.columns)} columns.")
         except Exception as e:
             st.error(f"Error reading file: {str(e)}")
@@ -202,797 +291,720 @@ with st.sidebar:
     st.subheader("Clio API Integration")
     st.info("Clio API integration will be available in the full version.")
     
-    # Filter settings
-    if st.session_state.data is not None:
+    # Saved Charts Section in sidebar
+    if st.session_state.chart_history:
         st.markdown("---")
-        st.subheader("Filters")
+        st.subheader("Saved Charts")
+        for i, chart in enumerate(st.session_state.chart_history):
+            st.write(f"{i+1}. {chart.get('name', 'Unnamed Chart')}")
         
-        # Date range filter if date columns are available
-        if st.session_state.date_columns:
-            selected_date_col = st.selectbox("Date Column", st.session_state.date_columns)
-            
-            if selected_date_col:
-                try:
-                    df_dates = pd.to_datetime(st.session_state.data[selected_date_col])
-                    min_date = df_dates.min().date()
-                    max_date = df_dates.max().date()
-                    
-                    date_range = st.date_input(
-                        "Date Range",
-                        value=(min_date, max_date),
-                        min_value=min_date,
-                        max_value=max_date
-                    )
-                    
-                    if len(date_range) == 2:
-                        start_date, end_date = date_range
-                        mask = (df_dates.dt.date >= start_date) & (df_dates.dt.date <= end_date)
-                        st.session_state.filtered_data = st.session_state.data[mask]
-                except Exception as e:
-                    st.warning(f"Could not apply date filter: {str(e)}")
-        
-        # Category filters
-        if st.session_state.categorical_columns:
-            selected_cat_col = st.selectbox("Category Filter", st.session_state.categorical_columns)
-            
-            if selected_cat_col:
-                unique_values = st.session_state.filtered_data[selected_cat_col].dropna().unique()
-                selected_values = st.multiselect(
-                    f"Select {selected_cat_col}",
-                    options=unique_values,
-                    default=list(unique_values)
-                )
-                
-                if selected_values:
-                    st.session_state.filtered_data = st.session_state.filtered_data[
-                        st.session_state.filtered_data[selected_cat_col].isin(selected_values)
-                    ]
-        
-        # Numeric range filter
-        if st.session_state.numeric_columns:
-            selected_num_col = st.selectbox("Numeric Filter", st.session_state.numeric_columns)
-            
-            if selected_num_col:
-                min_val = float(st.session_state.filtered_data[selected_num_col].min())
-                max_val = float(st.session_state.filtered_data[selected_num_col].max())
-                
-                value_range = st.slider(
-                    f"{selected_num_col} Range",
-                    min_value=min_val,
-                    max_value=max_val,
-                    value=(min_val, max_val)
-                )
-                
-                st.session_state.filtered_data = st.session_state.filtered_data[
-                    (st.session_state.filtered_data[selected_num_col] >= value_range[0]) & 
-                    (st.session_state.filtered_data[selected_num_col] <= value_range[1])
-                ]
+        st.info("View your saved charts in the Dashboard tab.")
 
 # Main area
 st.title("Law Firm Analytics Dashboard")
 
 # Display data overview
 if st.session_state.data is not None:
-    # Display tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["Attorney Performance", "Practice Area Analysis", "Matter Insights", "Custom Visualizations"])
-    
-    with tab1:
-        st.header("Attorney Performance Dashboard")
+    # Step 1: Initial data analysis
+    if 'analyzed' not in st.session_state or not st.session_state.analyzed:
+        st.header("Step 1: CSV Data Analysis")
         
-        # Attorney-specific KPIs
-        # Calculate key metrics if columns exist
-        df = st.session_state.filtered_data
+        st.write("Let's understand what's in your data:")
         
-        # Attorney selection
-        if 'User full name (first, last)' in df.columns:
-            attorneys = sorted(df['User full name (first, last)'].unique())
-            selected_attorney = st.selectbox("Select Attorney", ["All Attorneys"] + list(attorneys))
-            
-            if selected_attorney != "All Attorneys":
-                df = df[df['User full name (first, last)'] == selected_attorney]
+        # Show data overview
+        st.subheader("Data Sample")
+        st.dataframe(st.session_state.data.head(5), use_container_width=True)
         
-        # KPI metrics section
-        st.subheader("Key Performance Indicators")
-        
-        # First row of KPIs
-        kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
-        
-        with kpi_col1:
-            if 'Billed hours' in df.columns:
-                total_billed = df['Billed hours'].sum()
-                st.metric("Total Billed Hours", f"{total_billed:.1f}")
-            else:
-                st.metric("Total Billed Hours", "N/A")
-                
-        with kpi_col2:
-            if 'Non-billable hours' in df.columns:
-                total_non_billable = df['Non-billable hours'].sum()
-                st.metric("Non-Billable Hours", f"{total_non_billable:.1f}")
-            else:
-                st.metric("Non-Billable Hours", "N/A")
-        
-        with kpi_col3:
-            if 'Utilization rate' in df.columns:
-                avg_utilization = df['Utilization rate'].mean()
-                st.metric("Avg Utilization Rate", f"{avg_utilization:.1f}%")
-            else:
-                st.metric("Avg Utilization Rate", "N/A")
-        
-        with kpi_col4:
-            if 'Billed hours value' in df.columns:
-                total_billed_value = df['Billed hours value'].sum()
-                st.metric("Total Billed Value", f"${total_billed_value:,.2f}")
-            else:
-                st.metric("Total Billed Value", "N/A")
-        
-        # Data preview
-        st.subheader("Data Preview")
-        st.dataframe(st.session_state.filtered_data.head(10), use_container_width=True)
-        
-        # Column summary
-        st.subheader("Column Summary")
-        
-        col_stats = []
-        for col in st.session_state.columns:
+        # Column information
+        st.subheader("Column Information")
+        col_info = []
+        for col in st.session_state.data.columns:
             col_type = "Date" if col in st.session_state.date_columns else \
-                      "Numeric" if col in st.session_state.numeric_columns else "Categorical"
-                      
-            # Basic stats
-            missing = st.session_state.data[col].isna().sum()
-            missing_pct = (missing / len(st.session_state.data)) * 100
+                      "Numeric" if col in st.session_state.numeric_columns else "Text"
             
-            # Additional stats based on column type
+            non_null = st.session_state.data[col].count()
+            total_rows = len(st.session_state.data)
+            completeness = (non_null / total_rows) * 100
+            
             if col_type == "Numeric":
-                min_val = st.session_state.data[col].min()
-                max_val = st.session_state.data[col].max()
-                mean_val = st.session_state.data[col].mean()
-                additional_info = f"Min: {min_val:.2f}, Max: {max_val:.2f}, Mean: {mean_val:.2f}"
-            elif col_type == "Categorical":
-                unique_vals = st.session_state.data[col].nunique()
-                additional_info = f"Unique values: {unique_vals}"
+                stats = f"Min: {st.session_state.data[col].min()}, Max: {st.session_state.data[col].max()}, Avg: {st.session_state.data[col].mean():.2f}"
+            elif col_type == "Text":
+                unique = st.session_state.data[col].nunique()
+                stats = f"Unique values: {unique} ({(unique/total_rows*100):.1f}% of total)"
             else:  # Date
                 try:
-                    date_series = pd.to_datetime(st.session_state.data[col])
-                    min_date = date_series.min()
-                    max_date = date_series.max()
-                    additional_info = f"Range: {min_date.date()} to {max_date.date()}"
+                    date_range = pd.to_datetime(st.session_state.data[col])
+                    stats = f"Range: {date_range.min().date()} to {date_range.max().date()}"
                 except:
-                    additional_info = "Date conversion error"
+                    stats = "Unable to parse dates"
             
-            col_stats.append({
+            col_info.append({
                 "Column": col,
                 "Type": col_type,
-                "Missing": f"{missing} ({missing_pct:.1f}%)",
-                "Details": additional_info
+                "Completeness": f"{completeness:.1f}%",
+                "Statistics": stats
             })
         
-        st.dataframe(pd.DataFrame(col_stats), use_container_width=True)
+        st.dataframe(pd.DataFrame(col_info), use_container_width=True)
         
-        # Attorney performance charts
-        st.subheader("Performance Analysis")
-        
-        chart_col1, chart_col2 = st.columns(2)
-        
-        # Utilization Rate Over Time
-        with chart_col1:
-            if all(col in df.columns for col in ['Activity date', 'Utilization rate']):
-                try:
-                    # Convert to datetime if it's not already
-                    df['Activity date'] = pd.to_datetime(df['Activity date'])
-                    
-                    # Group by month and calculate average utilization rate
-                    monthly_util = df.groupby(df['Activity date'].dt.strftime('%Y-%m'))[['Utilization rate']].mean().reset_index()
-                    monthly_util = monthly_util.sort_values('Activity date')
-                    
-                    fig = px.line(
-                        monthly_util, 
-                        x="Activity date", 
-                        y="Utilization rate",
-                        title="Monthly Utilization Rate",
-                        labels={"Utilization rate": "Utilization %", "Activity date": "Month"},
-                        markers=True
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception as e:
-                    st.error(f"Error creating utilization chart: {str(e)}")
-            else:
-                st.info("Utilization rate data not available.")
-        
-        # Billable vs Non-billable Hours
-        with chart_col2:
-            if all(col in df.columns for col in ['Billed hours', 'Non-billable hours']):
-                try:
-                    # Create a summary dataframe
-                    hours_summary = pd.DataFrame({
-                        'Category': ['Billable Hours', 'Non-billable Hours'],
-                        'Hours': [df['Billed hours'].sum(), df['Non-billable hours'].sum()]
-                    })
-                    
-                    fig = px.pie(
-                        hours_summary,
-                        values='Hours',
-                        names='Category',
-                        title="Billable vs Non-billable Hours Distribution",
-                        color_discrete_sequence=px.colors.sequential.Blues_r
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception as e:
-                    st.error(f"Error creating hours distribution chart: {str(e)}")
-            else:
-                st.info("Billable and non-billable hours data not available.")
-        
-        # Attorney Time Tracking Analysis
-        st.subheader("Time Tracking Analysis")
-        
-        time_col1, time_col2 = st.columns(2)
-        
-        # Hours by Practice Area
-        with time_col1:
-            if all(col in df.columns for col in ['Practice area', 'Billed hours']):
-                try:
-                    # Group by practice area
-                    practice_hours = df.groupby('Practice area')[['Billed hours']].sum().reset_index()
-                    practice_hours = practice_hours.sort_values('Billed hours', ascending=False)
-                    
-                    fig = px.bar(
-                        practice_hours,
-                        x='Practice area',
-                        y='Billed hours',
-                        title="Billable Hours by Practice Area",
-                        color='Billed hours',
-                        color_continuous_scale=px.colors.sequential.Blues
-                    )
-                    fig.update_layout(xaxis_tickangle=-45)
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception as e:
-                    st.error(f"Error creating practice area chart: {str(e)}")
-            else:
-                st.info("Practice area and billable hours data not available.")
-        
-        # Monthly Hours Trend
-        with time_col2:
-            if all(col in df.columns for col in ['Activity date', 'Billed hours', 'Non-billable hours']):
-                try:
-                    # Convert to datetime if it's not already
-                    df['Activity date'] = pd.to_datetime(df['Activity date'])
-                    
-                    # Group by month and calculate hours
-                    monthly_hours = df.groupby(df['Activity date'].dt.strftime('%Y-%m'))[['Billed hours', 'Non-billable hours']].sum().reset_index()
-                    monthly_hours = monthly_hours.sort_values('Activity date')
-                    
-                    fig = px.bar(
-                        monthly_hours,
-                        x='Activity date',
-                        y=['Billed hours', 'Non-billable hours'],
-                        title="Monthly Hours Breakdown",
-                        labels={"value": "Hours", "Activity date": "Month", "variable": "Category"},
-                        barmode='group'
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception as e:
-                    st.error(f"Error creating monthly hours chart: {str(e)}")
-            else:
-                st.info("Monthly hours data not available.")
+        # Button to continue to LLM analysis
+        if st.button("Analyze Data with AI"):
+            st.session_state.analyzed = True
+            st.experimental_rerun()
     
-    with tab2:
-        st.header("Practice Area Analysis")
+    # Step 2: LLM Analysis of the data
+    elif 'llm_analysis_complete' not in st.session_state or not st.session_state.llm_analysis_complete:
+        st.header("Step 2: AI Analysis of Legal Data")
         
-        df = st.session_state.filtered_data
-        
-        # Practice area selection
-        if 'Practice area' in df.columns:
-            practice_areas = sorted(df['Practice area'].unique())
-            selected_practice = st.selectbox("Select Practice Area", ["All Practice Areas"] + list(practice_areas), key="practice_select")
+        with st.spinner("Claude is analyzing your legal data..."):
+            llm_analysis = analyze_csv_with_llm(st.session_state.data)
             
-            if selected_practice != "All Practice Areas":
-                df = df[df['Practice area'] == selected_practice]
-        
-        # Practice area KPIs
-        st.subheader("Practice Area Metrics")
-        
-        pa_kpi_col1, pa_kpi_col2, pa_kpi_col3, pa_kpi_col4 = st.columns(4)
-        
-        with pa_kpi_col1:
-            if 'Billed hours' in df.columns:
-                total_pa_billed = df['Billed hours'].sum()
-                st.metric("Total Billed Hours", f"{total_pa_billed:.1f}")
+            if llm_analysis:
+                st.session_state.llm_analysis = llm_analysis
+                st.session_state.llm_analysis_complete = True
+                
+                # Extract column mapping
+                st.session_state.column_mapping = {}
+                for category, columns in llm_analysis.get('column_mapping', {}).items():
+                    for col in columns:
+                        if col in st.session_state.data.columns:
+                            st.session_state.column_mapping[category + "_" + col] = col
+                
+                # Save suggested visualizations
+                st.session_state.suggested_visualizations = llm_analysis.get('suggested_visualizations', [])
+                
+                # Identify data type
+                st.session_state.data_type = llm_analysis.get('data_type', 'Legal billing data')
+                
+                st.success("AI analysis complete!")
+                st.experimental_rerun()
             else:
-                st.metric("Total Billed Hours", "N/A")
-                
-        with pa_kpi_col2:
-            if 'Billed hours value' in df.columns:
-                avg_hourly_rate = df['Billed hours value'].sum() / max(df['Billed hours'].sum(), 1)
-                st.metric("Avg. Hourly Rate", f"${avg_hourly_rate:.2f}")
-            else:
-                st.metric("Avg. Hourly Rate", "N/A")
-        
-        with pa_kpi_col3:
-            if 'Matter description' in df.columns:
-                matter_count = df['Matter description'].nunique()
-                st.metric("Active Matters", f"{matter_count}")
-            else:
-                st.metric("Active Matters", "N/A")
-        
-        with pa_kpi_col4:
-            if 'User full name (first, last)' in df.columns:
-                attorney_count = df['User full name (first, last)'].nunique()
-                st.metric("Attorneys Involved", f"{attorney_count}")
-            else:
-                st.metric("Attorneys Involved", "N/A")
-                
-        # Practice area charts
-        st.subheader("Practice Area Performance")
-        
-        pa_chart_col1, pa_chart_col2 = st.columns(2)
-        
-        # Top Matters by Hours
-        with pa_chart_col1:
-            if all(col in df.columns for col in ['Matter description', 'Billed hours']):
-                try:
-                    # Group by matter
-                    matter_hours = df.groupby('Matter description')[['Billed hours']].sum().reset_index()
-                    matter_hours = matter_hours.sort_values('Billed hours', ascending=False).head(10)
-                    
-                    fig = px.bar(
-                        matter_hours,
-                        x='Billed hours',
-                        y='Matter description',
-                        title="Top 10 Matters by Billable Hours",
-                        orientation='h',
-                        color='Billed hours',
-                        color_continuous_scale=px.colors.sequential.Blues
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception as e:
-                    st.error(f"Error creating top matters chart: {str(e)}")
-            else:
-                st.info("Matter and billable hours data not available.")
-        
-        # Top Attorneys in Practice Area
-        with pa_chart_col2:
-            if all(col in df.columns for col in ['User full name (first, last)', 'Billed hours']):
-                try:
-                    # Group by attorney
-                    attorney_hours = df.groupby('User full name (first, last)')[['Billed hours']].sum().reset_index()
-                    attorney_hours = attorney_hours.sort_values('Billed hours', ascending=False).head(10)
-                    
-                    fig = px.bar(
-                        attorney_hours,
-                        x='Billed hours',
-                        y='User full name (first, last)',
-                        title="Top 10 Attorneys by Billable Hours",
-                        orientation='h',
-                        color='Billed hours',
-                        color_continuous_scale=px.colors.sequential.Blues
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception as e:
-                    st.error(f"Error creating top attorneys chart: {str(e)}")
-            else:
-                st.info("Attorney and billable hours data not available.")
-        
-        # Monthly Trend for Practice Area
-        st.subheader("Monthly Trends")
-        
-        if all(col in df.columns for col in ['Activity date', 'Billed hours', 'Utilization rate']):
-            try:
-                # Convert to datetime if it's not already
-                df['Activity date'] = pd.to_datetime(df['Activity date'])
-                
-                # Group by month
-                monthly_data = df.groupby(df['Activity date'].dt.strftime('%Y-%m')).agg({
-                    'Billed hours': 'sum',
-                    'Utilization rate': 'mean',
-                    'Billed hours value': 'sum'
-                }).reset_index()
-                monthly_data = monthly_data.sort_values('Activity date')
-                
-                # Create figure with secondary y-axis
-                fig = go.Figure()
-                
-                # Add traces
-                fig.add_trace(
-                    go.Bar(
-                        x=monthly_data['Activity date'],
-                        y=monthly_data['Billed hours'],
-                        name="Billed Hours",
-                        marker_color='rgb(55, 83, 109)'
-                    )
-                )
-                
-                fig.add_trace(
-                    go.Scatter(
-                        x=monthly_data['Activity date'],
-                        y=monthly_data['Utilization rate'],
-                        name="Utilization Rate",
-                        marker_color='rgb(26, 118, 255)',
-                        mode='lines+markers',
-                        yaxis="y2"
-                    )
-                )
-                
-                # Create axis objects
-                fig.update_layout(
-                    title="Monthly Performance Trends",
-                    xaxis=dict(title="Month"),
-                    yaxis=dict(
-                        title="Billed Hours",
-                        titlefont=dict(color="rgb(55, 83, 109)"),
-                        tickfont=dict(color="rgb(55, 83, 109)")
-                    ),
-                    yaxis2=dict(
-                        title="Utilization Rate (%)",
-                        titlefont=dict(color="rgb(26, 118, 255)"),
-                        tickfont=dict(color="rgb(26, 118, 255)"),
-                        anchor="x",
-                        overlaying="y",
-                        side="right"
-                    ),
-                    legend=dict(x=0.01, y=0.99),
-                    margin=dict(l=50, r=50, t=50, b=50)
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"Error creating monthly trends chart: {str(e)}")
-        else:
-            st.info("Monthly trend data not available.")
-            
-    with tab3:
-        st.header("Matter Insights")
-        
-        df = st.session_state.filtered_data
-        
-        # Matter selection
-        if 'Matter description' in df.columns:
-            matters = sorted(df['Matter description'].unique())
-            selected_matter = st.selectbox("Select Matter", ["All Matters"] + list(matters), key="matter_select")
-            
-            if selected_matter != "All Matters":
-                df = df[df['Matter description'] == selected_matter]
-        
-        # Matter KPIs
-        st.subheader("Matter Metrics")
-        
-        matter_kpi_col1, matter_kpi_col2, matter_kpi_col3, matter_kpi_col4 = st.columns(4)
-        
-        with matter_kpi_col1:
-            if 'Billed hours' in df.columns:
-                total_matter_billed = df['Billed hours'].sum()
-                st.metric("Total Billed Hours", f"{total_matter_billed:.1f}")
-            else:
-                st.metric("Total Billed Hours", "N/A")
-                
-        with matter_kpi_col2:
-            if 'Billed hours value' in df.columns:
-                total_billings = df['Billed hours value'].sum()
-                st.metric("Total Billings", f"${total_billings:,.2f}")
-            else:
-                st.metric("Total Billings", "N/A")
-        
-        with matter_kpi_col3:
-            if 'User full name (first, last)' in df.columns:
-                attorney_count = df['User full name (first, last)'].nunique()
-                st.metric("Attorneys on Matter", f"{attorney_count}")
-            else:
-                st.metric("Attorneys on Matter", "N/A")
-        
-        with matter_kpi_col4:
-            if 'Matter status' in df.columns and selected_matter != "All Matters":
-                matter_status = df['Matter status'].iloc[0] if not df.empty else "Unknown"
-                st.metric("Matter Status", matter_status)
-            else:
-                st.metric("Matter Status", "Various" if selected_matter == "All Matters" else "N/A")
-                
-        # Matter charts
-        st.subheader("Matter Analysis")
-        
-        matter_chart_col1, matter_chart_col2 = st.columns(2)
-        
-        # Hours by Attorney
-        with matter_chart_col1:
-            if all(col in df.columns for col in ['User full name (first, last)', 'Billed hours']):
-                try:
-                    # Group by attorney
-                    attorney_matter_hours = df.groupby('User full name (first, last)')[['Billed hours']].sum().reset_index()
-                    attorney_matter_hours = attorney_matter_hours.sort_values('Billed hours', ascending=False)
-                    
-                    fig = px.pie(
-                        attorney_matter_hours,
-                        values='Billed hours',
-                        names='User full name (first, last)',
-                        title="Billable Hours Distribution by Attorney",
-                        color_discrete_sequence=px.colors.sequential.Blues
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception as e:
-                    st.error(f"Error creating attorney distribution chart: {str(e)}")
-            else:
-                st.info("Attorney and billable hours data not available.")
-        
-        # Billable vs Non-billable for Matter
-        with matter_chart_col2:
-            if all(col in df.columns for col in ['Billed hours', 'Non-billable hours']):
-                try:
-                    # Create a summary dataframe
-                    matter_hours_summary = pd.DataFrame({
-                        'Category': ['Billable Hours', 'Non-billable Hours'],
-                        'Hours': [df['Billed hours'].sum(), df['Non-billable hours'].sum()]
-                    })
-                    
-                    fig = px.bar(
-                        matter_hours_summary,
-                        x='Category',
-                        y='Hours',
-                        title="Billable vs Non-billable Hours",
-                        color='Category',
-                        color_discrete_map={
-                            'Billable Hours': 'rgb(26, 118, 255)',
-                            'Non-billable Hours': 'rgb(166, 189, 219)'
-                        }
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception as e:
-                    st.error(f"Error creating hours distribution chart: {str(e)}")
-            else:
-                st.info("Billable and non-billable hours data not available.")
-        
-        # Matter Timeline
-        st.subheader("Matter Timeline")
-        
-        if all(col in df.columns for col in ['Activity date', 'Billed hours']):
-            try:
-                # Convert to datetime if it's not already
-                df['Activity date'] = pd.to_datetime(df['Activity date'])
-                
-                # Group by date
-                daily_hours = df.groupby(df['Activity date'].dt.strftime('%Y-%m-%d'))[['Billed hours', 'Non-billable hours']].sum().reset_index()
-                daily_hours = daily_hours.sort_values('Activity date')
-                
-                fig = px.line(
-                    daily_hours,
-                    x='Activity date',
-                    y=['Billed hours', 'Non-billable hours'],
-                    title="Daily Hours Timeline",
-                    labels={"value": "Hours", "Activity date": "Date", "variable": "Category"},
-                    markers=True
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"Error creating timeline chart: {str(e)}")
-        else:
-            st.info("Timeline data not available.")
-        
-        # Matter additional information
-        if selected_matter != "All Matters":
-            st.subheader("Matter Details")
-            
-            matter_info_col1, matter_info_col2 = st.columns(2)
-            
-            with matter_info_col1:
-                if 'Matter status' in df.columns:
-                    st.markdown(f"**Status:** {df['Matter status'].iloc[0] if not df.empty else 'Unknown'}")
-                
-                if 'Practice area' in df.columns:
-                    st.markdown(f"**Practice Area:** {df['Practice area'].iloc[0] if not df.empty else 'Unknown'}")
-                
-                if 'Responsible attorney' in df.columns:
-                    st.markdown(f"**Responsible Attorney:** {df['Responsible attorney'].iloc[0] if not df.empty else 'Unknown'}")
-            
-            with matter_info_col2:
-                if 'Originating attorney' in df.columns:
-                    st.markdown(f"**Originating Attorney:** {df['Originating attorney'].iloc[0] if not df.empty else 'Unknown'}")
-                
-                if 'Matter close date' in df.columns:
-                    close_date = df['Matter close date'].iloc[0] if not df.empty else 'Unknown'
-                    st.markdown(f"**Close Date:** {close_date}")
-                
-                if 'Billable matter' in df.columns:
-                    billable = "Yes" if df['Billable matter'].iloc[0] == 1 else "No" if not df.empty else "Unknown"
-                    st.markdown(f"**Billable Matter:** {billable}")
+                st.error("Could not complete AI analysis. Please try again.")
     
-    with tab4:
-        st.header("Custom Visualizations")
+    # Step 3: Show the AI analysis results
+    elif 'dashboard_ready' not in st.session_state or not st.session_state.dashboard_ready:
+        st.header("Step 3: AI Insights")
         
-        # LLM-guided visualization
-        st.subheader("AI-Guided Visualization")
+        llm_analysis = st.session_state.llm_analysis
         
-        question = st.text_input(
-            "What would you like to visualize? Describe in natural language",
-            placeholder="E.g., Show me the trend of billable hours over time by practice area"
-        )
+        # Display data type
+        st.subheader("Data Type Identified")
+        st.info(llm_analysis.get('data_type', 'Legal billing data'))
         
-        if question and st.button("Generate Visualization"):
-            with st.spinner("Analyzing your data and generating visualization..."):
-                recommendation = get_visualization_recommendation(
-                    st.session_state.filtered_data,
-                    question
+        # Display column mapping
+        st.subheader("Column Mapping")
+        
+        col_map = llm_analysis.get('column_mapping', {})
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("##### Client Information")
+            for col in col_map.get('client', []):
+                st.write(f"- {col}")
+            
+            st.markdown("##### Matter Information")
+            for col in col_map.get('matter', []):
+                st.write(f"- {col}")
+            
+            st.markdown("##### Timekeeper Information")
+            for col in col_map.get('timekeeper', []):
+                st.write(f"- {col}")
+        
+        with col2:
+            st.markdown("##### Time Entries")
+            for col in col_map.get('time_entries', []):
+                st.write(f"- {col}")
+            
+            st.markdown("##### Billing Information")
+            for col in col_map.get('billing', []):
+                st.write(f"- {col}")
+            
+            st.markdown("##### Categorization")
+            for col in col_map.get('categorization', []):
+                st.write(f"- {col}")
+        
+        # Display suggested visualizations
+        st.subheader("Suggested Visualizations")
+        
+        viz_suggestions = llm_analysis.get('suggested_visualizations', [])
+        
+        for i, viz in enumerate(viz_suggestions):
+            with st.expander(f"{i+1}. {viz.get('title', 'Visualization')}"):
+                st.write(viz.get('description', 'No description provided.'))
+        
+        # Button to continue to dashboard
+        if st.button("Continue to Dashboard"):
+            st.session_state.dashboard_ready = True
+            st.experimental_rerun()
+    
+    # Step 4: Show the actual dashboard
+    else:
+        # Display tabs for the dashboard
+        tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Data Explorer", "Suggested Visualizations", "Custom Visualizations"])
+        
+        with tab1:
+            st.header("Data Overview Dashboard")
+            
+            # Display data type and summary
+            st.subheader("About This Data")
+            st.write(st.session_state.data_type)
+            
+            # Key metrics based on data type
+            st.subheader("Key Metrics")
+            
+            metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
+            
+            df = st.session_state.filtered_data
+            
+            # Dynamically determine which metrics to show based on available columns
+            col_map = st.session_state.llm_analysis.get('column_mapping', {})
+            
+            with metrics_col1:
+                # Try to show total records
+                st.metric("Total Records", f"{len(df):,}")
+            
+            with metrics_col2:
+                # Try to show unique matters or clients
+                if col_map.get('matter'):
+                    matter_col = col_map.get('matter')[0]
+                    if matter_col in df.columns:
+                        unique_matters = df[matter_col].nunique()
+                        st.metric("Unique Matters", f"{unique_matters:,}")
+                elif col_map.get('client'):
+                    client_col = col_map.get('client')[0]
+                    if client_col in df.columns:
+                        unique_clients = df[client_col].nunique()
+                        st.metric("Unique Clients", f"{unique_clients:,}")
+            
+            with metrics_col3:
+                # Try to show total hours or amount
+                hour_cols = [col for col in df.columns if 'hour' in col.lower()]
+                amount_cols = [col for col in df.columns if any(term in col.lower() for term in ['amount', 'value', 'fee', 'bill'])]
+                
+                if hour_cols:
+                    total_hours = df[hour_cols[0]].sum()
+                    st.metric("Total Hours", f"{total_hours:,.1f}")
+                elif amount_cols:
+                    total_amount = df[amount_cols[0]].sum()
+                    st.metric("Total Amount", f"${total_amount:,.2f}")
+            
+            with metrics_col4:
+                # Try to show unique timekeepers
+                if col_map.get('timekeeper'):
+                    timekeeper_col = col_map.get('timekeeper')[0]
+                    if timekeeper_col in df.columns:
+                        unique_timekeepers = df[timekeeper_col].nunique()
+                        st.metric("Timekeepers", f"{unique_timekeepers:,}")
+            
+            # Quick summary visualizations
+            st.subheader("Data Summary")
+            
+            summary_col1, summary_col2 = st.columns(2)
+            
+            with summary_col1:
+                # Try to create categorical breakdown
+                category_cols = col_map.get('categorization', [])
+                if category_cols and category_cols[0] in df.columns:
+                    cat_col = category_cols[0]
+                    cat_counts = df[cat_col].value_counts().reset_index()
+                    cat_counts.columns = [cat_col, 'Count']
+                    
+                    try:
+                        fig = px.pie(
+                            cat_counts, 
+                            values='Count', 
+                            names=cat_col,
+                            title=f"Breakdown by {cat_col}"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Could not create chart: {str(e)}")
+            
+            with summary_col2:
+                # Try to create time-based visualization
+                date_cols = col_map.get('time_entries', [])
+                date_cols = [col for col in date_cols if col in st.session_state.date_columns]
+                
+                if date_cols and date_cols[0] in df.columns:
+                    date_col = date_cols[0]
+                    
+                    try:
+                        df['date_parsed'] = pd.to_datetime(df[date_col])
+                        df['month'] = df['date_parsed'].dt.strftime('%Y-%m')
+                        
+                        # Aggregate by month
+                        monthly_data = df.groupby('month').size().reset_index()
+                        monthly_data.columns = ['Month', 'Count']
+                        
+                        fig = px.line(
+                            monthly_data,
+                            x='Month',
+                            y='Count',
+                            title="Monthly Activity",
+                            markers=True
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Could not create time chart: {str(e)}")
+                        
+            # Data filters section
+            st.subheader("Data Filters")
+            
+            filter_container = st.container()
+            
+            with filter_container:
+                filter_col1, filter_col2, filter_col3 = st.columns(3)
+                
+                filtered_data = df.copy()
+                
+                # Try to add date filter
+                with filter_col1:
+                    if date_cols and date_cols[0] in df.columns:
+                        date_col = date_cols[0]
+                        st.subheader("Date Filter")
+                        
+                        try:
+                            df['date_parsed'] = pd.to_datetime(df[date_col])
+                            min_date = df['date_parsed'].min().date()
+                            max_date = df['date_parsed'].max().date()
+                            
+                            date_range = st.date_input(
+                                "Select Date Range",
+                                value=(min_date, max_date),
+                                min_value=min_date,
+                                max_value=max_date
+                            )
+                            
+                            if len(date_range) == 2:
+                                start_date, end_date = date_range
+                                filtered_data = filtered_data[
+                                    (filtered_data['date_parsed'].dt.date >= start_date) & 
+                                    (filtered_data['date_parsed'].dt.date <= end_date)
+                                ]
+                        except Exception as e:
+                            st.error(f"Could not apply date filter: {str(e)}")
+                
+                # Try to add category filter
+                with filter_col2:
+                    if category_cols and category_cols[0] in df.columns:
+                        cat_col = category_cols[0]
+                        st.subheader("Category Filter")
+                        
+                        unique_cats = df[cat_col].dropna().unique()
+                        selected_cats = st.multiselect(
+                            f"Select {cat_col}",
+                            options=sorted(unique_cats),
+                            default=list(unique_cats)[:min(5, len(unique_cats))]
+                        )
+                        
+                        if selected_cats:
+                            filtered_data = filtered_data[filtered_data[cat_col].isin(selected_cats)]
+                
+                # Try to add client/matter filter
+                with filter_col3:
+                    client_cols = col_map.get('client', [])
+                    matter_cols = col_map.get('matter', [])
+                    
+                    if client_cols and client_cols[0] in df.columns:
+                        client_col = client_cols[0]
+                        st.subheader("Client Filter")
+                        
+                        unique_clients = df[client_col].dropna().unique()
+                        selected_client = st.selectbox(
+                            f"Select {client_col}",
+                            options=["All Clients"] + sorted(unique_clients)
+                        )
+                        
+                        if selected_client != "All Clients":
+                            filtered_data = filtered_data[filtered_data[client_col] == selected_client]
+                    elif matter_cols and matter_cols[0] in df.columns:
+                        matter_col = matter_cols[0]
+                        st.subheader("Matter Filter")
+                        
+                        unique_matters = df[matter_col].dropna().unique()
+                        selected_matter = st.selectbox(
+                            f"Select {matter_col}",
+                            options=["All Matters"] + sorted(unique_matters)[:100]  # Limit to 100 for performance
+                        )
+                        
+                        if selected_matter != "All Matters":
+                            filtered_data = filtered_data[filtered_data[matter_col] == selected_matter]
+                
+                # Update the filtered data
+                st.session_state.filtered_data = filtered_data
+                
+                # Show filtered records count
+                st.metric("Filtered Records", f"{len(filtered_data):,} ({len(filtered_data)/len(df)*100:.1f}% of total)")
+        
+        with tab2:
+            st.header("Data Explorer")
+            
+            df = st.session_state.filtered_data
+            
+            # Column selector
+            st.subheader("Column Explorer")
+            
+            explorer_col1, explorer_col2 = st.columns([1, 3])
+            
+            with explorer_col1:
+                selected_column = st.selectbox("Select Column to Explore", st.session_state.columns)
+                
+                if selected_column:
+                    col_type = "Date" if selected_column in st.session_state.date_columns else \
+                            "Numeric" if selected_column in st.session_state.numeric_columns else "Text"
+                    
+                    st.write(f"**Type:** {col_type}")
+                    
+                    non_null = df[selected_column].count()
+                    total_rows = len(df)
+                    completeness = (non_null / total_rows) * 100
+                    
+                    st.write(f"**Completeness:** {completeness:.1f}%")
+                    
+                    if col_type == "Numeric":
+                        st.write(f"**Min:** {df[selected_column].min()}")
+                        st.write(f"**Max:** {df[selected_column].max()}")
+                        st.write(f"**Mean:** {df[selected_column].mean():.2f}")
+                        st.write(f"**Median:** {df[selected_column].median()}")
+                    elif col_type == "Text":
+                        unique = df[selected_column].nunique()
+                        st.write(f"**Unique Values:** {unique}")
+            
+            with explorer_col2:
+                if selected_column:
+                    if col_type == "Numeric":
+                        fig = px.histogram(
+                            df,
+                            x=selected_column,
+                            title=f"Distribution of {selected_column}"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    elif col_type == "Text":
+                        value_counts = df[selected_column].value_counts().reset_index()
+                        value_counts.columns = [selected_column, 'Count']
+                        value_counts = value_counts.sort_values('Count', ascending=False).head(20)
+                        
+                        fig = px.bar(
+                            value_counts,
+                            x=selected_column,
+                            y='Count',
+                            title=f"Top Values for {selected_column}"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:  # Date
+                        try:
+                            date_series = pd.to_datetime(df[selected_column])
+                            df_temp = pd.DataFrame({
+                                'date': date_series,
+                                'count': 1
+                            })
+                            df_temp['month'] = df_temp['date'].dt.strftime('%Y-%m')
+                            
+                            monthly_counts = df_temp.groupby('month')['count'].sum().reset_index()
+                            
+                            fig = px.line(
+                                monthly_counts,
+                                x='month',
+                                y='count',
+                                title=f"Timeline of {selected_column}",
+                                markers=True
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        except Exception as e:
+                            st.error(f"Could not create timeline chart: {str(e)}")
+            
+            # Cross-column analysis
+            st.subheader("Cross-Column Analysis")
+            
+            crosscol1, crosscol2 = st.columns(2)
+            
+            with crosscol1:
+                x_col = st.selectbox("Select X-Axis Column", st.session_state.columns, key="xcol")
+                y_col = st.selectbox("Select Y-Axis Column", 
+                                     [c for c in st.session_state.numeric_columns if c != x_col],
+                                     key="ycol")
+                color_col = st.selectbox("Color By (Optional)", 
+                                        ["None"] + [c for c in st.session_state.categorical_columns if c != x_col],
+                                        key="colorcol")
+                color_col = None if color_col == "None" else color_col
+                
+            with crosscol2:
+                try:
+                    if x_col in st.session_state.categorical_columns:
+                        # For categorical x, use bar chart
+                        fig = px.bar(
+                            df,
+                            x=x_col,
+                            y=y_col,
+                            color=color_col,
+                            title=f"{y_col} by {x_col}",
+                            height=500
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    elif x_col in st.session_state.date_columns:
+                        # For date x, use line chart
+                        try:
+                            # Convert to datetime and group by month
+                            df['date_temp'] = pd.to_datetime(df[x_col])
+                            df['month_temp'] = df['date_temp'].dt.strftime('%Y-%m')
+                            
+                            # Group by month
+                            if color_col:
+                                monthly_data = df.groupby(['month_temp', color_col])[y_col].mean().reset_index()
+                                fig = px.line(
+                                    monthly_data,
+                                    x='month_temp',
+                                    y=y_col,
+                                    color=color_col,
+                                    title=f"{y_col} by Month",
+                                    labels={"month_temp": "Month"},
+                                    markers=True
+                                )
+                            else:
+                                monthly_data = df.groupby('month_temp')[y_col].mean().reset_index()
+                                fig = px.line(
+                                    monthly_data,
+                                    x='month_temp',
+                                    y=y_col,
+                                    title=f"{y_col} by Month",
+                                    labels={"month_temp": "Month"},
+                                    markers=True
+                                )
+                            st.plotly_chart(fig, use_container_width=True)
+                        except Exception as e:
+                            st.error(f"Could not create time series chart: {str(e)}")
+                    else:
+                        # For numeric x, use scatter
+                        fig = px.scatter(
+                            df,
+                            x=x_col,
+                            y=y_col,
+                            color=color_col,
+                            title=f"{y_col} vs. {x_col}",
+                            opacity=0.7,
+                            height=500
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Could not create cross-column chart: {str(e)}")
+                    
+            # Data table with search
+            st.subheader("Data Table")
+            
+            search_term = st.text_input("Search in data", "")
+            
+            if search_term:
+                # Search across all columns
+                mask = pd.Series(False, index=df.index)
+                for col in df.columns:
+                    if df[col].dtype == 'object':  # For string columns
+                        mask = mask | df[col].astype(str).str.contains(search_term, case=False, na=False)
+                    else:  # For numeric columns
+                        # Convert search term to number if possible
+                        try:
+                            num_search = float(search_term)
+                            mask = mask | (df[col] == num_search)
+                        except:
+                            pass
+                
+                search_results = df[mask]
+                st.dataframe(search_results, use_container_width=True)
+            else:
+                # Show first 100 rows if no search
+                st.dataframe(df.head(100), use_container_width=True)
+                
+        with tab3:
+            st.header("Suggested Visualizations")
+            
+            df = st.session_state.filtered_data
+            
+            # Get the suggested visualizations from Claude
+            suggested_vizs = st.session_state.suggested_visualizations
+            
+            if not suggested_vizs:
+                st.info("No visualizations were suggested. Try analyzing the data again or create custom visualizations.")
+            else:
+                for i, viz in enumerate(suggested_vizs):
+                    st.subheader(f"{i+1}. {viz.get('title', 'Visualization')}")
+                    st.write(viz.get('description', 'No description provided.'))
+                    
+                    # Try to create a visualization based on the description
+                    # This is a simplified implementation that creates basic charts
+                    
+                    col_map = st.session_state.llm_analysis.get('column_mapping', {})
+                    
+                    # Check if the description mentions specific columns
+                    desc = viz.get('description', '').lower()
+                    
+                    # Prepare placeholder for the chart
+                    chart_container = st.container()
+                    
+                    # Get a visualization from Claude
+                    question = viz.get('description', '')
+                    
+                    if st.button(f"Generate Visualization #{i+1}"):
+                        with st.spinner("Creating visualization..."):
+                            recommendation = get_visualization_recommendation(df, question)
+                            
+                            if recommendation:
+                                with chart_container:
+                                    # Display the recommendation
+                                    with st.expander("View recommendation details"):
+                                        st.json(recommendation)
+                                    
+                                    # Create and display the visualization
+                                    fig = create_visualization(df, recommendation)
+                                    if fig:
+                                        st.plotly_chart(fig, use_container_width=True)
+                                        
+                                        # Option to save chart
+                                        if st.button(f"Save to Dashboard #{i+1}"):
+                                            chart_entry = {
+                                                "name": recommendation.get("title", viz.get('title', 'Untitled Chart')),
+                                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                                "recommendation": recommendation,
+                                                "query": question
+                                            }
+                                            st.session_state.chart_history.append(chart_entry)
+                                            st.success("Chart saved to dashboard!")
+                    
+                    st.markdown("---")
+                    
+        with tab4:
+            st.header("Custom Visualizations")
+            
+            df = st.session_state.filtered_data
+            
+            # Add a selector for visualization type
+            viz_type = st.radio(
+                "Choose visualization approach:",
+                ["AI-Guided Visualization", "Manual Chart Builder"]
+            )
+            
+            if viz_type == "AI-Guided Visualization":
+                # LLM-guided visualization
+                st.subheader("AI-Guided Visualization")
+                
+                question = st.text_input(
+                    "What would you like to visualize? Describe in natural language",
+                    placeholder="E.g., Show me the trend of billable hours over time by practice area"
                 )
                 
-                if recommendation:
-                    st.success("Visualization recommendation created!")
+                if question and st.button("Generate Visualization"):
+                    with st.spinner("Analyzing your data and generating visualization..."):
+                        recommendation = get_visualization_recommendation(
+                            df,
+                            question
+                        )
+                        
+                        if recommendation:
+                            st.success("Visualization recommendation created!")
+                            
+                            # Display the recommendation
+                            with st.expander("View recommendation details"):
+                                st.json(recommendation)
+                            
+                            # Create and display the visualization
+                            fig = create_visualization(df, recommendation)
+                            if fig:
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                                # Option to save chart
+                                if st.button("Save to Dashboard"):
+                                    chart_entry = {
+                                        "name": recommendation.get("title", "Untitled Chart"),
+                                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                        "recommendation": recommendation,
+                                        "query": question
+                                    }
+                                    st.session_state.chart_history.append(chart_entry)
+                                    st.success("Chart saved to dashboard!")
+            else:
+                # Manual chart builder
+                st.subheader("Manual Chart Builder")
+                
+                chart_col1, chart_col2 = st.columns(2)
+                
+                with chart_col1:
+                    chart_type = st.selectbox(
+                        "Chart Type",
+                        ["Bar Chart", "Line Chart", "Scatter Plot", "Pie Chart", "Box Plot"]
+                    )
                     
-                    # Display the recommendation
-                    with st.expander("View recommendation details"):
-                        st.json(recommendation)
+                    # Use all available columns
+                    available_columns = st.session_state.columns
                     
-                    # Create and display the visualization
-                    fig = create_visualization(st.session_state.filtered_data, recommendation)
-                    if fig:
+                    x_axis = st.selectbox("X-Axis", available_columns)
+                    
+                    if chart_type != "Pie Chart":
+                        y_axis = st.selectbox("Y-Axis", st.session_state.numeric_columns if st.session_state.numeric_columns else available_columns)
+                    else:
+                        y_axis = st.selectbox("Values", st.session_state.numeric_columns if st.session_state.numeric_columns else available_columns)
+                    
+                    color_by = st.selectbox("Color By (Optional)", ["None"] + st.session_state.categorical_columns)
+                    color_by = None if color_by == "None" else color_by
+                    
+                    chart_title = st.text_input("Chart Title", f"{chart_type} of {y_axis} by {x_axis}")
+                
+                with chart_col2:
+                    try:
+                        if chart_type == "Bar Chart":
+                            fig = px.bar(
+                                df,
+                                x=x_axis,
+                                y=y_axis,
+                                color=color_by,
+                                title=chart_title
+                            )
+                        elif chart_type == "Line Chart":
+                            fig = px.line(
+                                df,
+                                x=x_axis,
+                                y=y_axis,
+                                color=color_by,
+                                title=chart_title
+                            )
+                        elif chart_type == "Scatter Plot":
+                            fig = px.scatter(
+                                df,
+                                x=x_axis,
+                                y=y_axis,
+                                color=color_by,
+                                title=chart_title
+                            )
+                        elif chart_type == "Pie Chart":
+                            fig = px.pie(
+                                df,
+                                names=x_axis,
+                                values=y_axis,
+                                title=chart_title
+                            )
+                        elif chart_type == "Box Plot":
+                            fig = px.box(
+                                df,
+                                x=x_axis,
+                                y=y_axis,
+                                color=color_by,
+                                title=chart_title
+                            )
+                        
                         st.plotly_chart(fig, use_container_width=True)
                         
-                        # Option to save chart
-                        if st.button("Save to Dashboard"):
+                        # Save option
+                        if st.button("Save this chart"):
                             chart_entry = {
-                                "name": recommendation.get("title", "Untitled Chart"),
+                                "name": chart_title,
                                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "recommendation": recommendation,
-                                "query": question
+                                "type": chart_type,
+                                "x_axis": x_axis,
+                                "y_axis": y_axis,
+                                "color_by": color_by
                             }
                             st.session_state.chart_history.append(chart_entry)
                             st.success("Chart saved to dashboard!")
-        
-        # Manual chart builder
-        st.subheader("Manual Chart Builder")
-        
-        chart_col1, chart_col2 = st.columns(2)
-        
-        with chart_col1:
-            chart_type = st.selectbox(
-                "Chart Type",
-                ["Bar Chart", "Line Chart", "Scatter Plot", "Pie Chart", "Box Plot"]
-            )
-            
-            x_axis = st.selectbox("X-Axis", st.session_state.columns)
-            
-            if chart_type != "Pie Chart":
-                y_axis = st.selectbox("Y-Axis", st.session_state.numeric_columns if st.session_state.numeric_columns else st.session_state.columns)
-            else:
-                y_axis = st.selectbox("Values", st.session_state.numeric_columns if st.session_state.numeric_columns else st.session_state.columns)
-            
-            color_by = st.selectbox("Color By (Optional)", ["None"] + st.session_state.categorical_columns)
-            color_by = None if color_by == "None" else color_by
-            
-            chart_title = st.text_input("Chart Title", f"{chart_type} of {y_axis} by {x_axis}")
-        
-        with chart_col2:
-            try:
-                if chart_type == "Bar Chart":
-                    fig = px.bar(
-                        st.session_state.filtered_data,
-                        x=x_axis,
-                        y=y_axis,
-                        color=color_by,
-                        title=chart_title
-                    )
-                elif chart_type == "Line Chart":
-                    fig = px.line(
-                        st.session_state.filtered_data,
-                        x=x_axis,
-                        y=y_axis,
-                        color=color_by,
-                        title=chart_title
-                    )
-                elif chart_type == "Scatter Plot":
-                    fig = px.scatter(
-                        st.session_state.filtered_data,
-                        x=x_axis,
-                        y=y_axis,
-                        color=color_by,
-                        title=chart_title
-                    )
-                elif chart_type == "Pie Chart":
-                    fig = px.pie(
-                        st.session_state.filtered_data,
-                        names=x_axis,
-                        values=y_axis,
-                        title=chart_title
-                    )
-                elif chart_type == "Box Plot":
-                    fig = px.box(
-                        st.session_state.filtered_data,
-                        x=x_axis,
-                        y=y_axis,
-                        color=color_by,
-                        title=chart_title
-                    )
-                
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Save option
-                if st.button("Save this chart"):
-                    chart_entry = {
-                        "name": chart_title,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "type": chart_type,
-                        "x_axis": x_axis,
-                        "y_axis": y_axis,
-                        "color_by": color_by
-                    }
-                    st.session_state.chart_history.append(chart_entry)
-                    st.success("Chart saved to dashboard!")
-            except Exception as e:
-                st.error(f"Error creating chart: {str(e)}")
-    
-    with tab3:
-        st.header("Saved Charts")
-        
-        if not st.session_state.chart_history:
-            st.info("No saved charts yet. Create and save charts from the Custom Visualizations tab.")
-        else:
-            # Display saved charts in a grid
-            for i in range(0, len(st.session_state.chart_history), 2):
-                cols = st.columns(2)
-                
-                for j in range(2):
-                    if i + j < len(st.session_state.chart_history):
-                        chart = st.session_state.chart_history[i + j]
-                        
-                        with cols[j]:
-                            st.subheader(chart["name"])
-                            st.caption(f"Created: {chart['timestamp']}")
-                            
-                            try:
-                                # Recreate chart based on type
-                                if "recommendation" in chart:
-                                    # LLM-recommended chart
-                                    fig = create_visualization(
-                                        st.session_state.filtered_data,
-                                        chart["recommendation"]
-                                    )
-                                else:
-                                    # Manually created chart
-                                    chart_type = chart["type"]
-                                    
-                                    if chart_type == "Bar Chart":
-                                        fig = px.bar(
-                                            st.session_state.filtered_data,
-                                            x=chart["x_axis"],
-                                            y=chart["y_axis"],
-                                            color=chart["color_by"],
-                                            title=chart["name"]
-                                        )
-                                    elif chart_type == "Line Chart":
-                                        fig = px.line(
-                                            st.session_state.filtered_data,
-                                            x=chart["x_axis"],
-                                            y=chart["y_axis"],
-                                            color=chart["color_by"],
-                                            title=chart["name"]
-                                        )
-                                    elif chart_type == "Scatter Plot":
-                                        fig = px.scatter(
-                                            st.session_state.filtered_data,
-                                            x=chart["x_axis"],
-                                            y=chart["y_axis"],
-                                            color=chart["color_by"],
-                                            title=chart["name"]
-                                        )
-                                    elif chart_type == "Pie Chart":
-                                        fig = px.pie(
-                                            st.session_state.filtered_data,
-                                            names=chart["x_axis"],
-                                            values=chart["y_axis"],
-                                            title=chart["name"]
-                                        )
-                                    elif chart_type == "Box Plot":
-                                        fig = px.box(
-                                            st.session_state.filtered_data,
-                                            x=chart["x_axis"],
-                                            y=chart["y_axis"],
-                                            color=chart["color_by"],
-                                            title=chart["name"]
-                                        )
-                                
-                                if fig:
-                                    st.plotly_chart(fig, use_container_width=True)
-                                    
-                                    # Option to remove chart
-                                    if st.button(f"Remove", key=f"remove_{i}_{j}"):
-                                        st.session_state.chart_history.pop(i + j)
-                                        st.rerun()
-                            except Exception as e:
-                                st.error(f"Error recreating chart: {str(e)}")
+                    except Exception as e:
+                        st.error(f"Error creating chart: {str(e)}")
 else:
     # No data uploaded yet
     st.info("👈 Please upload a CSV file to get started.")
@@ -1002,9 +1014,9 @@ else:
     ## How to use this dashboard
     
     1. **Upload Data**: Start by uploading a CSV file with your law firm data.
-    2. **Explore Data**: View summary statistics and quick visualizations.
-    3. **Create Custom Charts**: Use the AI assistant to generate visualizations or build them manually.
-    4. **Save to Dashboard**: Save your favorite charts to create a custom dashboard.
+    2. **AI Analysis**: Let Claude analyze your data and identify key legal fields.
+    3. **Explore Visualizations**: View AI-suggested visualizations or create your own.
+    4. **Filter & Customize**: Filter data and save visualizations to your dashboard.
     
     ### Example data you can use
     Upload CSV files containing information such as:
@@ -1026,4 +1038,5 @@ col1, col2 = st.columns([4, 1])
 with col1:
     st.caption("Law Firm Analytics Dashboard Prototype | Powered by Streamlit and Claude")
 with col2:
-    st.caption("v0.1.0")
+    st.caption("v0.2.0")
+                    
