@@ -55,10 +55,12 @@ def detect_column_types(df):
 
 # Function to use Claude to analyze the CSV and identify relevant columns
 def analyze_csv_with_llm(df):
-    api_key = st.session_state.get('api_key')
-    
-    if not api_key or api_key == "your-default-api-key-here":
-        st.error("No valid API key configured. Please update the application with a valid Anthropic API key.")
+    # Get API key directly from secrets with the correct key name (all caps)
+    try:
+        api_key = st.secrets["ANTHROPIC_API_KEY"]
+        client = anthropic.Anthropic(api_key=api_key)
+    except Exception as e:
+        st.error(f"Could not access API key: {str(e)}")
         return None
     
     client = anthropic.Anthropic(api_key=api_key)
@@ -140,11 +142,12 @@ def analyze_csv_with_llm(df):
 
 # Function to generate LLM visualization recommendation
 def get_visualization_recommendation(df, question):
-    # Use the API key that's already in session state
-    api_key = st.session_state.get('api_key')
-    
-    if not api_key or api_key == "your-default-api-key-here":
-        st.error("No valid API key configured. Please update the application with a valid Anthropic API key.")
+    # Get API key directly from secrets with the correct key name (all caps)
+    try:
+        api_key = st.secrets["ANTHROPIC_API_KEY"]
+        client = anthropic.Anthropic(api_key=api_key)
+    except Exception as e:
+        st.error(f"Could not access API key: {str(e)}")
         return None
     
     client = anthropic.Anthropic(api_key=api_key)
